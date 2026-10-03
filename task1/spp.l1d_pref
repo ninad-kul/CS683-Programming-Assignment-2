@@ -1,0 +1,288 @@
+//File for Stride pattern prefetcher
+
+
+#include "cache.h"
+#include <vector>
+#include <iostream>
+#include <cstdint>
+#include <cassert>
+
+// ============================================================================
+// CONFIGURATION PARAMETERS & CONSTANTS
+// ============================================================================
+#define IP_TRACKER_COUNT 64      // Tracking table size (IP-indexed)
+#define PATTERN_TABLE_COUNT 512  // Signature-indexed pattern table
+#define SIG_MASK 0x1FF           // 9-bit mask for pattern table index (512 entries)
+#define MAX_DEGREE 4             // Maximum dynamic prefetch degree
+#define MIN_DEGREE 1             // Minimum dynamic prefetch degree
+#define INITIAL_DEGREE 3         // Starting prefetch degree
+#define ACCURACY_EPOCH 256       // Number of prefetches per accuracy evaluation cycle
+#define PREFETCH_FILTER_SIZE 128 // Active prefetch tracking filter size
+
+// ============================================================================
+// DATA STRUCTURES
+// ============================================================================
+
+// IP Tracker: Tracks memory accesses per Instruction Pointer (IP)
+class IP_TRACKER_ENTRY {
+public:
+    uint64_t ip;
+    uint64_t last_cl_addr;
+    int64_t  last_stride;
+    uint8_t  uniform_confidence; // 2-bit counter (0-3) for uniform stride detection
+    uint16_t signature;          // Running hash of recent stride history
+    uint32_t lru;                // LRU eviction counter
+
+    IP_TRACKER_ENTRY() {
+        ip = 0;
+        last_cl_addr = 0;
+        last_stride = 0;
+        uniform_confidence = 0;
+        signature = 0;
+        lru = 0;
+    }
+};
+
+// Pattern Table Entry: Maps a stride signature to the next predicted stride
+class PATTERN_ENTRY {
+public:
+    int64_t stride;
+    uint8_t confidence; // Counter tracking pattern confidence (0-3)
+
+    PATTERN_ENTRY() {
+        stride = 0;
+        confidence = 0;
+    }
+};
+
+// ============================================================================
+// GLOBAL STATE & TABLES
+// ============================================================================
+static IP_TRACKER_ENTRY ip_table[IP_TRACKER_COUNT];
+static PATTERN_ENTRY pattern_table[PATTERN_TABLE_COUNT];
+
+// Dynamic Throttling & Accuracy Tracker State
+static uint32_t current_degree = INITIAL_DEGREE;
+static uint64_t epoch_issued_prefetches = 0;
+static uint64_t epoch_useful_prefetches = 0;
+
+// Circular buffer to track active prefetched cache line addresses for accuracy calculations
+static uint64_t prefetch_filter[PREFETCH_FILTER_SIZE];
+static uint32_t pf_filter_head = 0;
+
+// ============================================================================
+// HELPER FUNCTIONS
+// ============================================================================
+
+// Updates signature by shifting in the lower bits of the new stride
+static uint16_t update_signature(uint16_t old_sig, int64_t stride) {
+    uint16_t stride_bits = (uint16_t)(stride & 0x1F); // Use lower 5 bits of stride
+    return ((old_sig << 3) ^ stride_bits) & SIG_MASK;
+}
+
+// Records an issued prefetch into our tracking filter to measure usefulness
+static void record_issued_prefetch(uint64_t pf_cl_addr) {
+    prefetch_filter[pf_filter_head] = pf_cl_addr;
+    pf_filter_head = (pf_filter_head + 1) % PREFETCH_FILTER_SIZE;
+    epoch_issued_prefetches++;
+}
+
+// Checks if a demand access hit a previously prefetched line
+static bool check_and_clear_useful_prefetch(uint64_t cl_addr) {
+    for (uint32_t i = 0; i < PREFETCH_FILTER_SIZE; i++) {
+        if (prefetch_filter[i] == cl_addr) {
+            prefetch_filter[i] = 0; // Clear entry to avoid double counting
+            return true;
+        }
+    }
+    return false;
+}
+
+// Evaluates prefetch accuracy every epoch and dynamically scales prefetch degree
+static void adjust_prefetch_degree() {
+    if (epoch_issued_prefetches < ACCURACY_EPOCH)
+        return;
+
+    double accuracy = (double)epoch_useful_prefetches / (double)epoch_issued_prefetches;
+
+    // High accuracy (>65%): Increase aggressiveness
+    if (accuracy > 0.65 && current_degree < MAX_DEGREE) {
+        current_degree++;
+    }
+    // Low accuracy (<30%): Decrease aggressiveness to reduce cache pollution
+    else if (accuracy < 0.30 && current_degree > MIN_DEGREE) {
+        current_degree--;
+    }
+
+    // Reset epoch metrics
+    epoch_issued_prefetches = 0;
+    epoch_useful_prefetches = 0;
+}
+
+// ============================================================================
+// CHAMPSIM API FUNCTIONS
+// ============================================================================
+
+void CACHE::l1d_prefetcher_initialize()
+{
+    std::cout << "------------------------------------------------" << std::endl;
+    std::cout << "     Stride Pattern Prefetcher (SPP) Loaded     " << std::endl;
+    std::cout << "------------------------------------------------" << std::endl;
+
+    for (int i = 0; i < IP_TRACKER_COUNT; i++) {
+        ip_table[i].lru = i;
+    }
+
+    for (int i = 0; i < PREFETCH_FILTER_SIZE; i++) {
+        prefetch_filter[i] = 0;
+    }
+}
+
+void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t type, uint8_t critical_ip_flag)
+{
+    uint64_t cl_addr = addr >> LOG2_BLOCK_SIZE;
+
+    // 1. Accuracy Check: Record useful prefetch if a demand access hit a prefetched line
+    if (cache_hit && check_and_clear_useful_prefetch(cl_addr)) {
+        epoch_useful_prefetches++;
+    }
+
+    // Evaluate and adjust prefetch degree dynamically
+    adjust_prefetch_degree();
+
+    // 2. Lookup IP in the IP Tracker Table
+    int index = -1;
+    for (int i = 0; i < IP_TRACKER_COUNT; i++) {
+        if (ip_table[i].ip == ip) {
+            index = i;
+            break;
+        }
+    }
+
+    // 3. IP Table Miss: Allocate new tracker entry using LRU replacement
+    if (index == -1) {
+        for (int i = 0; i < IP_TRACKER_COUNT; i++) {
+            if (ip_table[i].lru == (IP_TRACKER_COUNT - 1)) {
+                index = i;
+                break;
+            }
+        }
+
+        ip_table[index].ip = ip;
+        ip_table[index].last_cl_addr = cl_addr;
+        ip_table[index].last_stride = 0;
+        ip_table[index].uniform_confidence = 0;
+        ip_table[index].signature = 0;
+
+        // Update LRU positions
+        for (int i = 0; i < IP_TRACKER_COUNT; i++) {
+            if (ip_table[i].lru < ip_table[index].lru)
+                ip_table[i].lru++;
+        }
+        ip_table[index].lru = 0;
+        return;
+    }
+
+    // Calculate current stride
+    int64_t curr_stride = (int64_t)cl_addr - (int64_t)ip_table[index].last_cl_addr;
+
+    // Ignore duplicate accesses to the exact same cache line
+    if (curr_stride == 0)
+        return;
+
+    // 4. Pattern Classification Logic
+    bool is_uniform = (curr_stride == ip_table[index].last_stride);
+
+    if (is_uniform) {
+        if (ip_table[index].uniform_confidence < 3)
+            ip_table[index].uniform_confidence++;
+    } else {
+        if (ip_table[index].uniform_confidence > 0)
+            ip_table[index].uniform_confidence--;
+    }
+
+    uint16_t prev_sig = ip_table[index].signature;
+
+    // 5. Dual Pattern Prefetching Strategy
+    
+    // PATH A: Uniform Stride Mode (High Uniform Confidence)
+    if (ip_table[index].uniform_confidence >= 2) {
+        for (uint32_t d = 1; d <= current_degree; d++) {
+            uint64_t pf_cl_addr = cl_addr + (curr_stride * d);
+            uint64_t pf_address = pf_cl_addr << LOG2_BLOCK_SIZE;
+
+            // Stay within physical page boundary
+            if ((pf_address >> LOG2_PAGE_SIZE) != (addr >> LOG2_PAGE_SIZE))
+                break;
+
+            // Issue prefetch request
+            int ok = prefetch_line(ip, addr, pf_address, FILL_L1, 0);
+            if (ok) {
+                record_issued_prefetch(pf_cl_addr);
+            }
+        }
+    } 
+    // PATH B: Non-Uniform Stride Fallback Mode (Pattern Table Lookups via Signatures)
+    else {
+        // Update Pattern Table: map previous signature to this newly observed stride
+        if (pattern_table[prev_sig].stride == curr_stride) {
+            if (pattern_table[prev_sig].confidence < 3)
+                pattern_table[prev_sig].confidence++;
+        } else {
+            if (pattern_table[prev_sig].confidence == 0) {
+                pattern_table[prev_sig].stride = curr_stride;
+                pattern_table[prev_sig].confidence = 1;
+            } else {
+                pattern_table[prev_sig].confidence--;
+            }
+        }
+
+        // Multi-degree prediction walk over non-uniform stride sequence
+        uint16_t curr_sig = update_signature(prev_sig, curr_stride);
+        uint64_t curr_pf_cl = cl_addr;
+
+        for (uint32_t d = 1; d <= current_degree; d++) {
+            PATTERN_ENTRY entry = pattern_table[curr_sig];
+
+            if (entry.confidence < 1 || entry.stride == 0)
+                break; // Low confidence, stop chaining
+
+            curr_pf_cl = curr_pf_cl + entry.stride;
+            uint64_t pf_address = curr_pf_cl << LOG2_BLOCK_SIZE;
+
+            // Stay within physical page boundary
+            if ((pf_address >> LOG2_PAGE_SIZE) != (addr >> LOG2_PAGE_SIZE))
+                break;
+
+            int ok = prefetch_line(ip, addr, pf_address, FILL_L1, 0);
+            if (ok) {
+                record_issued_prefetch(curr_pf_cl);
+            }
+
+            // Chain to the next expected signature in the sequence
+            curr_sig = update_signature(curr_sig, entry.stride);
+        }
+    }
+
+    // 6. Update Tracker State & LRU
+    ip_table[index].last_cl_addr = cl_addr;
+    ip_table[index].last_stride = curr_stride;
+    ip_table[index].signature = update_signature(prev_sig, curr_stride);
+
+    for (int i = 0; i < IP_TRACKER_COUNT; i++) {
+        if (ip_table[i].lru < ip_table[index].lru)
+            ip_table[i].lru++;
+    }
+    ip_table[index].lru = 0;
+}
+
+void CACHE::l1d_prefetcher_cache_fill(uint64_t v_addr, uint64_t addr, uint32_t set, uint32_t way, uint8_t prefetch, uint64_t v_evicted_addr, uint64_t evicted_addr, uint32_t metadata_in)
+{
+    return;
+}
+
+void CACHE::l1d_prefetcher_final_stats()
+{
+    std::cout << "--- SPP Final Stats ---" << std::endl;
+    std::cout << "Final Dynamic Prefetch Degree: " << current_degree << std::endl;
+}
