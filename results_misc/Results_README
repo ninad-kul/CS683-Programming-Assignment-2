@@ -1,0 +1,3 @@
+The results are for different prefetcher implementations (no prefetch, ip stride and stride patter prefetcher) and different L2 replacement policies (lru and I-RRIP).
+File naming : l1<prefetch name>_l2<policy name>_<trace used>.txt
+Ex - *l1no_l2lru_trace1.txt* : this means the results are for no prefetcher on l1, lru replacement policy on l2 and simulation is run on Trace1.gz
