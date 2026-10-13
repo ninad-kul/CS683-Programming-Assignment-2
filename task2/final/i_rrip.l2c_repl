@@ -1,0 +1,99 @@
+#include "cache.h"
+#include <cassert>
+#include <iostream>
+
+
+#define maxRRPV 3	// Maximum RRPV value for 2-bit RRPV state (0 to 3)
+// running with the run_task2.sh bash script changes these with sed
+
+// fixing best performing parameters after analyzing
+//#define INST_QUOTA        (L2C_WAY / 2)	
+#define INST_QUOTA        8		// Maximum ways allowed for instruction lines per set
+
+
+#define INST_INSERT_RRPV  2		// Insertion RRPV for instruction fills
+#define DATA_INSERT_RRPV  (maxRRPV - 1)		// Insertion RRPV for data demand fills
+
+
+//#define WB_INSERT_RRPV    (maxRRPV - 1)
+#define WB_INSERT_RRPV    2
+
+
+
+uint32_t l2_rrpv[L2C_SET][L2C_WAY];		// RRPV matrix for each cache set and way
+bool     l2_is_inst[L2C_SET][L2C_WAY];
+
+
+// Returns the total number of instruction lines currently resident in a given set
+static inline uint32_t count_inst(uint32_t set)
+{
+    uint32_t n = 0;
+    for (int i = 0; i < L2C_WAY; i++) if (l2_is_inst[set][i]) n++;
+    return n;
+}
+
+
+// Searches and increments RRPVs until a victim with maxRRPV is found within the chosen class
+static inline uint32_t evict_in_class(uint32_t set, bool want_inst)
+{
+    while (1) {
+        for (int i = 0; i < L2C_WAY; i++)
+            if (l2_is_inst[set][i] == want_inst && l2_rrpv[set][i] == maxRRPV) return i;
+        for (int i = 0; i < L2C_WAY; i++)
+            if (l2_is_inst[set][i] == want_inst && l2_rrpv[set][i] < maxRRPV) l2_rrpv[set][i]++;
+    }
+}
+
+
+// Initializes L2 cache replacement state
+void CACHE::l2c_initialize_replacement()
+{
+    std::cout << "Initialize I-RRIP (class-partitioned) state for L2C" << std::endl;
+    for (int i = 0; i < L2C_SET; i++)
+        for (int j = 0; j < L2C_WAY; j++) { l2_rrpv[i][j] = maxRRPV; l2_is_inst[i][j] = false; }
+}
+
+
+// Finds a replacement victim by checking for invalid lines first, then enforcing class quota
+uint32_t CACHE::l2c_find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set, const BLOCK *current_set,
+                                uint64_t ip, uint64_t full_addr, uint32_t type)
+{
+    for (int i = 0; i < L2C_WAY; i++)
+        if (!current_set[i].valid) return i;
+
+    uint32_t n_inst = count_inst(set);
+    bool from_inst = (n_inst > INST_QUOTA) || (n_inst == L2C_WAY);
+    return evict_in_class(set, from_inst);
+}
+
+
+// 9 parameter implementation 
+void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t way, uint64_t full_addr,
+                                         uint64_t ip, uint64_t victim_addr, uint32_t type,
+                                         uint8_t hit, uint8_t isInstruction)
+{
+    bool wb   = (type == WRITEBACK);
+    bool inst = (isInstruction > 0) && !wb;
+
+    if (hit) {
+        if (wb) return;                              // no reuse information
+        if (inst) l2_is_inst[set][way] = true;       // sticky flag
+        l2_rrpv[set][way] = 0;
+        return;
+    }
+
+    l2_is_inst[set][way] = inst;
+    l2_rrpv[set][way] = wb ? WB_INSERT_RRPV : (inst ? INST_INSERT_RRPV : DATA_INSERT_RRPV);
+}
+
+
+// 8 parameter overload wrapper 
+void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t way, uint64_t full_addr,
+                                         uint64_t ip, uint64_t victim_addr, uint32_t type, uint8_t hit)
+{
+    // Infer instruction access from ChampSim's type parameter (type 4 is LOAD_INSTRUCTION / TRANSLATION)
+    uint8_t isInstruction = (type == 4) ? 1 : 0;
+    l2c_update_replacement_state(cpu, set, way, full_addr, ip, victim_addr, type, hit, isInstruction);
+}
+
+void CACHE::l2c_replacement_final_stats() {}

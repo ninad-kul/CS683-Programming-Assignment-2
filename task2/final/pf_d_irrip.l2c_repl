@@ -1,0 +1,206 @@
+
+// FOR TASK 3
+
+#include "cache.h"
+#include <cassert>
+#include <iostream>
+
+#define maxRRPV 3
+
+// ---- switches (one #define per line; run_task2.sh rewrites these with sed) ----
+#define PF_AWARE          1      // 0 = Task 2B runs, 1 = Task 3 runs
+#define USE_DUEL          0      // 1 = extension: also compare I-RRIP leaders vs RRIP leaders
+#define THRESH_PCT        25
+
+// ---- I-RRIP knobs ----
+//#define INST_QUOTA        (L2C_WAY / 2)
+#define INST_QUOTA			8
+
+#define INST_INSERT_RRPV  2
+#define DATA_INSERT_RRPV  (maxRRPV - 1)
+
+//#define WB_INSERT_RRPV    (maxRRPV - 1)
+#define WB_INSERT_RRPV 		2
+
+#define INST_MISS_W       2
+
+// ---- leader sets (period 32) ----
+#define LEADER_MOD        32
+#define LEAD_RRIP         0      // always plain RRIP; monitors the instruction share
+#define LEAD_IRRIP        16     // always I-RRIP (only with USE_DUEL)
+#define LEAD_PF_NEAR      8      // prefetch fills inserted near (Task 3)
+#define LEAD_PF_FAR       24     // prefetch fills inserted far  (Task 3)
+
+#define EPOCH_ACCESSES    512
+#define PSEL_PF_MAX       1023
+#define PSEL_PF_MID       511
+
+uint32_t l2_rrpv[L2C_SET][L2C_WAY];
+bool     l2_is_inst[L2C_SET][L2C_WAY];
+bool     l2_pf[L2C_SET][L2C_WAY];        // prefetched and not yet used by a demand access
+
+static bool     irrip_mode = true;
+static uint64_t r_acc = 0, r_miss = 0, r_iacc = 0, r_imiss = 0;   // RRIP leaders
+static uint64_t p_imiss = 0, p_dmiss = 0;                          // I-RRIP leaders
+static uint64_t epochs = 0, epochs_irrip = 0;
+static uint32_t psel_pf = PSEL_PF_MID;
+static uint64_t pf_fills = 0, pf_useful = 0, pf_useless = 0;
+
+static inline uint32_t count_inst(uint32_t set)
+{
+    uint32_t n = 0;
+    for (int i = 0; i < L2C_WAY; i++) if (l2_is_inst[set][i]) n++;
+    return n;
+}
+
+static inline uint32_t evict_in_class(uint32_t set, bool want_inst)
+{
+    while (1) {
+        for (int i = 0; i < L2C_WAY; i++)
+            if (l2_is_inst[set][i] == want_inst && l2_rrpv[set][i] == maxRRPV) return i;
+        for (int i = 0; i < L2C_WAY; i++)
+            if (l2_is_inst[set][i] == want_inst && l2_rrpv[set][i] < maxRRPV) l2_rrpv[set][i]++;
+    }
+}
+
+static inline bool irrip_active(uint32_t set)
+{
+    uint32_t r = set % LEADER_MOD;
+    if (r == LEAD_RRIP) return false;
+#if USE_DUEL
+    if (r == LEAD_IRRIP) return true;
+#endif
+    return irrip_mode;
+}
+
+static void end_epoch()
+{
+    uint64_t num = (r_iacc + r_imiss) * 100, den = r_acc + r_miss;
+    bool share_ok = den && (num > (uint64_t)THRESH_PCT * den);
+    bool duel_ok = true;
+#if USE_DUEL
+    uint64_t cost_r = INST_MISS_W * r_imiss + (r_miss - r_imiss);
+    uint64_t cost_p = INST_MISS_W * p_imiss + p_dmiss;
+    duel_ok = (cost_p <= cost_r);
+#endif
+    irrip_mode = share_ok && duel_ok;
+    epochs++; if (irrip_mode) epochs_irrip++;
+
+    if ((epochs & 15) == 1)
+        std::cout << "[DYN-IRRIP] epoch " << epochs << " share=" << (den ? (double)num / (100.0 * den) : 0.0)
+                  << " mode=" << (irrip_mode ? "I-RRIP" : "RRIP")
+                  << " frac_irrip=" << (double)epochs_irrip / epochs << std::endl;
+
+    r_acc >>= 1; r_miss >>= 1; r_iacc >>= 1; r_imiss >>= 1;     // smoothing
+    p_imiss >>= 1; p_dmiss >>= 1;
+}
+
+void CACHE::l2c_initialize_replacement()
+{
+    std::cout << "Initialize Dynamic I-RRIP v3 for L2C, threshold " << THRESH_PCT
+              << "%, PF_AWARE=" << PF_AWARE << ", USE_DUEL=" << USE_DUEL << std::endl;
+    for (int i = 0; i < L2C_SET; i++)
+        for (int j = 0; j < L2C_WAY; j++) { l2_rrpv[i][j] = maxRRPV; l2_is_inst[i][j] = false; l2_pf[i][j] = false; }
+}
+
+uint32_t CACHE::l2c_find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set, const BLOCK *current_set,
+                                uint64_t ip, uint64_t full_addr, uint32_t type)
+{
+    for (int i = 0; i < L2C_WAY; i++)
+        if (!current_set[i].valid) return i;
+
+    if (irrip_active(set)) {
+        uint32_t n_inst = count_inst(set);
+        return evict_in_class(set, (n_inst > INST_QUOTA) || (n_inst == L2C_WAY));
+    }
+
+    while (1) {                                         // plain RRIP over all lines
+        for (int i = 0; i < L2C_WAY; i++)
+            if (l2_rrpv[set][i] == maxRRPV) return i;
+        for (int i = 0; i < L2C_WAY; i++)
+            if (l2_rrpv[set][i] < maxRRPV) l2_rrpv[set][i]++;
+    }
+    assert(0);
+    return 0;
+}
+
+// ---------------- 9-parameter implementation ----------------
+void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t way, uint64_t full_addr,
+                                         uint64_t ip, uint64_t victim_addr, uint32_t type,
+                                         uint8_t hit, uint8_t isInstruction)
+{
+    bool wb     = (type == WRITEBACK);
+    bool pf     = (type == PREFETCH);
+    bool inst   = (isInstruction > 0) && !wb && !pf;
+    bool demand = !wb && !pf;
+    uint32_t r  = set % LEADER_MOD;
+
+    // ---------- monitoring (demand traffic only) ----------
+    if (demand) {
+        if (r == LEAD_RRIP) {
+            r_acc++; if (inst) r_iacc++;
+            if (!hit) { r_miss++; if (inst) r_imiss++; }
+            if (r_acc >= EPOCH_ACCESSES) end_epoch();
+        }
+#if USE_DUEL
+        if (r == LEAD_IRRIP && !hit) { if (inst) p_imiss++; else p_dmiss++; }
+#endif
+#if PF_AWARE
+        if (!hit) {
+            uint32_t w = inst ? INST_MISS_W : 1;
+            if (r == LEAD_PF_NEAR) psel_pf = (psel_pf + w > PSEL_PF_MAX) ? PSEL_PF_MAX : psel_pf + w;
+            if (r == LEAD_PF_FAR)  psel_pf = (psel_pf > w) ? psel_pf - w : 0;
+        }
+#endif
+    }
+
+    // ---------- hit ----------
+    if (hit) {
+        if (wb) return;
+#if PF_AWARE
+        if (pf) return;                                           // prefetch hitting a resident line: no reuse
+        if (l2_pf[set][way]) { l2_pf[set][way] = false; pf_useful++; }
+#endif
+        if (inst) l2_is_inst[set][way] = true;
+        l2_rrpv[set][way] = 0;
+        return;
+    }
+
+    // ---------- fill ----------
+#if PF_AWARE
+    if (l2_pf[set][way]) pf_useless++;                           // evicting an unused prefetched line
+    l2_pf[set][way] = false;
+#endif
+    l2_is_inst[set][way] = inst;
+
+    if (wb) { l2_rrpv[set][way] = WB_INSERT_RRPV; return; }
+
+#if PF_AWARE
+    if (pf) {
+        bool near = (r == LEAD_PF_NEAR) || (r != LEAD_PF_FAR && psel_pf < PSEL_PF_MID);
+        l2_rrpv[set][way] = near ? (maxRRPV - 1) : maxRRPV;
+        l2_pf[set][way] = true;
+        pf_fills++;
+        return;
+    }
+#endif
+
+    l2_rrpv[set][way] = (irrip_active(set) && inst) ? INST_INSERT_RRPV : DATA_INSERT_RRPV;
+}
+
+// ---------------- 8-parameter overload wrapper ----------------
+void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t way, uint64_t full_addr,
+                                         uint64_t ip, uint64_t victim_addr, uint32_t type, uint8_t hit)
+{
+    // Infer instruction access from ChampSim's type parameter (type 4 is LOAD_INSTRUCTION / TRANSLATION)
+    uint8_t isInstruction = (type == 4) ? 1 : 0;
+    l2c_update_replacement_state(cpu, set, way, full_addr, ip, victim_addr, type, hit, isInstruction);
+}
+
+void CACHE::l2c_replacement_final_stats()
+{
+    std::cout << "[DYN-IRRIP] epochs=" << epochs << " frac_irrip="
+              << (epochs ? (double)epochs_irrip / epochs : 0.0)
+              << " pf_fills=" << pf_fills << " pf_useful=" << pf_useful << " pf_useless=" << pf_useless
+              << " psel_pf=" << psel_pf << std::endl;
+}
