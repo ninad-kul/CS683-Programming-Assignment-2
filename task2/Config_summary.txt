@@ -1,0 +1,10 @@
+The best configuration for the INST_QUOTA, INST_INSERT_RRPV, WB_INSERT_RRPV and THRESH_PCT (for task 2b) is mentioned here after observing the results obtained by running the bash script.
+
+//Best Results based on comparison for task 2a 
+Based on this sweep, the best-performing static knobs are:
+INST_QUOTA = 8 (50% of ways)
+INST_INSERT_RRPV = 2
+WB_INSERT_RRPV = 2
+
+// For task 2b
+THRESH_PCT = 25% (or 10%)
