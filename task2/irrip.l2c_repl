@@ -1,95 +1,85 @@
 #include "cache.h"
 #include <cassert>
 #include <iostream>
-#include <iomanip>
 
 #define maxRRPV 3
 
-// State arrays to track both RRPV and Instruction status
+// ---- tunables (ablate these for the write-up) ----
+#define INST_INSERT_RRPV  0
+#define DATA_INSERT_RRPV  (maxRRPV - 1)
+#define INST_HIT_RRPV     0
+#define DATA_HIT_RRPV     0                 // original code used 1
+#define INST_WAY_CAP      (L2C_WAY / 2)     // set to L2C_WAY to disable the cap
+
 uint32_t l2_rrpv[L2C_SET][L2C_WAY];
-bool l2_is_inst[L2C_SET][L2C_WAY];
+bool     l2_is_inst[L2C_SET][L2C_WAY];
 
-// Initialize replacement state
-void CACHE::l2c_initialize_replacement()
+static inline uint32_t count_inst(uint32_t set)
 {
-    std::cout << "Initialize I-RRIP state for L2C" << std::endl;
-
-    for (int i = 0; i < L2C_SET; i++) {
-        for (int j = 0; j < L2C_WAY; j++) {
-            l2_rrpv[i][j] = maxRRPV;
-            l2_is_inst[i][j] = false;
-        }
-    }
+    uint32_t n = 0;
+    for (int i = 0; i < L2C_WAY; i++) if (l2_is_inst[set][i]) n++;
+    return n;
 }
 
-// Find replacement victim
-uint32_t CACHE::l2c_find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set, const BLOCK *current_set, uint64_t ip, uint64_t full_addr, uint32_t type)
+void CACHE::l2c_initialize_replacement()
 {
-    // Pass 0: First, check for any invalid (empty) ways in the set
-    for (int i = 0; i < L2C_WAY; i++) {
-        if (!current_set[i].valid) {
-            return i;
-        }
+    std::cout << "Initialize I-RRIP (static) state for L2C" << std::endl;
+    for (int i = 0; i < L2C_SET; i++)
+        for (int j = 0; j < L2C_WAY; j++) { l2_rrpv[i][j] = maxRRPV; l2_is_inst[i][j] = false; }
+}
+
+uint32_t CACHE::l2c_find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set, const BLOCK *current_set,
+                                uint64_t ip, uint64_t full_addr, uint32_t type)
+{
+    for (int i = 0; i < L2C_WAY; i++)
+        if (!current_set[i].valid) return i;
+
+    while (1) {
+        for (int i = 0; i < L2C_WAY; i++)                       // data first
+            if (l2_rrpv[set][i] == maxRRPV && !l2_is_inst[set][i]) return i;
+        for (int i = 0; i < L2C_WAY; i++)                       // then instructions
+            if (l2_rrpv[set][i] == maxRRPV) return i;
+        for (int i = 0; i < L2C_WAY; i++)
+            if (l2_rrpv[set][i] < maxRRPV) l2_rrpv[set][i]++;
     }
-
-    // EVICTION LOGIC: Prioritize evicting non-instruction lines over instruction lines.
-    while (1)
-    {
-        // 1st Pass: Look for a DATA line with maxRRPV
-        for (int i = 0; i < L2C_WAY; i++) {
-            if (l2_rrpv[set][i] == maxRRPV && !l2_is_inst[set][i]) {
-                return i;
-            }
-        }
-
-        // 2nd Pass: Look for an INSTRUCTION line with maxRRPV
-        for (int i = 0; i < L2C_WAY; i++) {
-            if (l2_rrpv[set][i] == maxRRPV && l2_is_inst[set][i]) {
-                return i;
-            }
-        }
-
-        // If no line at maxRRPV is found, age all lines in the set (capped at maxRRPV)
-        for (int i = 0; i < L2C_WAY; i++) {
-            if (l2_rrpv[set][i] < maxRRPV) {
-                l2_rrpv[set][i]++;
-            }
-        }
-    }
-
-    // WE SHOULD NOT REACH HERE
     assert(0);
     return 0;
 }
 
-// Called on every cache hit and cache fill
-void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t way, uint64_t full_addr, uint64_t ip, uint64_t victim_addr, uint32_t type, uint8_t hit, uint8_t isInstruction)
+// ---------------- 9-parameter implementation ----------------
+void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t way, uint64_t full_addr,
+                                         uint64_t ip, uint64_t victim_addr, uint32_t type,
+                                         uint8_t hit, uint8_t isInstruction)
 {
-    // Update the instruction tracking state for this block
-    l2_is_inst[set][way] = (isInstruction > 0);
+    bool wb   = (type == WRITEBACK);
+    bool inst = (isInstruction > 0) && !wb;
 
     if (hit) {
-        // PROMOTION LOGIC
-        if (isInstruction) {
-            // Instructions are highly prioritized: promote to 0
-            l2_rrpv[set][way] = 0; 
-        } else {
-            // Data blocks are given less priority: promote to 1 instead of 0
-            l2_rrpv[set][way] = 1; 
-        }
-    } else {
-        // INSERTION LOGIC
-        if (isInstruction) {
-            // Instructions inserted with highest priority to protect them from quick eviction
-            l2_rrpv[set][way] = 0; 
-        } else {
-            // Data inserted with standard SRRIP policy (maxRRPV - 1)
-            l2_rrpv[set][way] = maxRRPV - 1; 
-        }
+        if (wb) return;                                  // no reuse information
+        if (inst) l2_is_inst[set][way] = true;           // sticky flag
+        l2_rrpv[set][way] = l2_is_inst[set][way] ? INST_HIT_RRPV : DATA_HIT_RRPV;
+        return;
     }
+
+    // fill
+    uint32_t n_inst = count_inst(set) - (l2_is_inst[set][way] ? 1 : 0);   // excluding the victim
+    l2_is_inst[set][way] = inst;
+    if (inst)
+        l2_rrpv[set][way] = (n_inst >= INST_WAY_CAP) ? DATA_INSERT_RRPV : INST_INSERT_RRPV;
+    else
+        l2_rrpv[set][way] = DATA_INSERT_RRPV;
 }
 
-// Use this function to print out your own stats at the end of simulation
-void CACHE::l2c_replacement_final_stats()
+// ---------------- 8-parameter overload wrapper ----------------
+void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t way, uint64_t full_addr,
+                                         uint64_t ip, uint64_t victim_addr, uint32_t type,
+                                         uint8_t hit)
 {
+    // Infer instruction access from ChampSim's type parameter (type 4 is LOAD_INSTRUCTION / TRANSLATION)
+    uint8_t isInstruction = (type == 4) ? 1 : 0;
+    
+    // Forward to the 9-parameter function
+    l2c_update_replacement_state(cpu, set, way, full_addr, ip, victim_addr, type, hit, isInstruction);
 }
+
+void CACHE::l2c_replacement_final_stats() {}
