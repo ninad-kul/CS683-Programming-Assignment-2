@@ -1,0 +1,120 @@
+#include "cache.h"
+#include <cassert>
+#include <iostream>
+
+#define maxRRPV 3
+
+#define INST_INSERT_RRPV  0
+#define DATA_INSERT_RRPV  (maxRRPV - 1)
+#define INST_HIT_RRPV     0
+#define DATA_HIT_RRPV     0
+#define INST_WAY_CAP      (L2C_WAY / 2)
+
+#define LEADER_MOD        32       // sets with set % 32 == 0 always run RRIP
+#define EPOCH_ACCESSES    1024     // demand accesses seen by leader sets per decision
+#ifndef THRESH_PCT
+#define THRESH_PCT        25       // sweep: 10, 25, 40, 55, 70
+#endif
+
+uint32_t l2_rrpv[L2C_SET][L2C_WAY];
+bool     l2_is_inst[L2C_SET][L2C_WAY];
+
+static bool     irrip_mode = true;
+static uint64_t ia = 0, im = 0, ta = 0, ep_tm = 0;           // epoch counters (leader sets)
+static uint64_t epochs = 0, epochs_irrip = 0;
+
+static inline bool is_leader(uint32_t set) { return (set % LEADER_MOD) == 0; }
+
+static inline uint32_t count_inst(uint32_t set)
+{
+    uint32_t n = 0;
+    for (int i = 0; i < L2C_WAY; i++) if (l2_is_inst[set][i]) n++;
+    return n;
+}
+
+static void end_epoch()
+{
+    uint64_t num = (ia + im) * 100, den = (ta + ep_tm);
+    irrip_mode = den && (num > (uint64_t)THRESH_PCT * den);
+    epochs++; if (irrip_mode) epochs_irrip++;
+    if ((epochs & 63) == 0)
+        std::cout << "[DYN-IRRIP] epoch " << epochs << " ratio=" << (den ? (double)num / (100.0 * den) : 0.0)
+                  << " mode=" << (irrip_mode ? "I-RRIP" : "RRIP")
+                  << " frac_irrip=" << (double)epochs_irrip / epochs << std::endl;
+    ia = im = ta = ep_tm = 0;
+}
+
+void CACHE::l2c_initialize_replacement()
+{
+    std::cout << "Initialize Dynamic I-RRIP for L2C, threshold " << THRESH_PCT << "%" << std::endl;
+    for (int i = 0; i < L2C_SET; i++)
+        for (int j = 0; j < L2C_WAY; j++) { l2_rrpv[i][j] = maxRRPV; l2_is_inst[i][j] = false; }
+}
+
+uint32_t CACHE::l2c_find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set, const BLOCK *current_set,
+                                uint64_t ip, uint64_t full_addr, uint32_t type)
+{
+    for (int i = 0; i < L2C_WAY; i++)
+        if (!current_set[i].valid) return i;
+
+    bool irrip = !is_leader(set) && irrip_mode;
+    while (1) {
+        if (irrip)
+            for (int i = 0; i < L2C_WAY; i++)
+                if (l2_rrpv[set][i] == maxRRPV && !l2_is_inst[set][i]) return i;
+        for (int i = 0; i < L2C_WAY; i++)
+            if (l2_rrpv[set][i] == maxRRPV) return i;
+        for (int i = 0; i < L2C_WAY; i++)
+            if (l2_rrpv[set][i] < maxRRPV) l2_rrpv[set][i]++;
+    }
+    assert(0);
+    return 0;
+}
+
+// ---------------- 9-parameter implementation ----------------
+void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t way, uint64_t full_addr,
+                                         uint64_t ip, uint64_t victim_addr, uint32_t type,
+                                         uint8_t hit, uint8_t isInstruction)
+{
+    bool wb   = (type == WRITEBACK);
+    bool inst = (isInstruction > 0) && !wb;
+    bool leader = is_leader(set);
+    bool irrip  = !leader && irrip_mode;
+
+    // monitoring in leader sets (demand traffic only)
+    if (leader && !wb) {
+        ta++; if (inst) ia++;
+        if (!hit) { ep_tm++; if (inst) im++; }
+        if (ta >= EPOCH_ACCESSES) end_epoch();
+    }
+
+    if (hit) {
+        if (wb) return;
+        if (inst) l2_is_inst[set][way] = true;                 // flag kept in every mode
+        if (irrip) l2_rrpv[set][way] = l2_is_inst[set][way] ? INST_HIT_RRPV : DATA_HIT_RRPV;
+        else       l2_rrpv[set][way] = 0;                      // plain RRIP-HP
+        return;
+    }
+
+    uint32_t n_inst = count_inst(set) - (l2_is_inst[set][way] ? 1 : 0);
+    l2_is_inst[set][way] = inst;
+    if (irrip && inst)
+        l2_rrpv[set][way] = (n_inst >= INST_WAY_CAP) ? DATA_INSERT_RRPV : INST_INSERT_RRPV;
+    else
+        l2_rrpv[set][way] = DATA_INSERT_RRPV;                  // SRRIP insertion
+}
+
+// ---------------- 8-parameter overload wrapper ----------------
+void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t way, uint64_t full_addr,
+                                         uint64_t ip, uint64_t victim_addr, uint32_t type,
+                                         uint8_t hit)
+{
+    uint8_t isInstruction = (type == 4) ? 1 : 0;
+    l2c_update_replacement_state(cpu, set, way, full_addr, ip, victim_addr, type, hit, isInstruction);
+}
+
+void CACHE::l2c_replacement_final_stats()
+{
+    std::cout << "[DYN-IRRIP] epochs=" << epochs << " frac_irrip="
+              << (epochs ? (double)epochs_irrip / epochs : 0.0) << std::endl;
+}
