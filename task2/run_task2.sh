@@ -17,8 +17,8 @@ JOBS=${JOBS:-$(( $(nproc) > 1 ? $(nproc) - 1 : 1 ))}
 FORCE=${FORCE:-0}                     # 1 = rerun even if a finished result exists
 L1D_PF=${L1D_PF:-no}                  # first argument of build_champsim.sh
 
-STATIC_BASE=${STATIC_BASE:-i_rrip}    # replacement/<name>.l2c_repl : static I-RRIP (Task 2A)
-DYN_BASE=${DYN_BASE:-d_irrip}         # replacement/<name>.l2c_repl : dynamic I-RRIP (Task 2B)
+STATIC_BASE=${STATIC_BASE:-irrip}     # replacement/<name>.l2c_repl : static I-RRIP (Task 2A)
+DYN_BASE=${DYN_BASE:-dyn_irrip}       # replacement/<name>.l2c_repl : dynamic I-RRIP (Task 2B)
 RRIP_BASE=${RRIP_BASE:-rrip}          # replacement/<name>.l2c_repl : plain RRIP baseline
 
 # 2A sweep, each entry "quota,inst_insert_rrpv,wb_insert_rrpv"
@@ -123,9 +123,9 @@ exp_2b() {
   name="exp_dyn_duel_t25"
   dst="replacement/${name}.l2c_repl"
   cp "$src" "$dst"
-  set_macro "$dst" THRESH_PCT 25              && \
-  set_macro "$dst" USE_DUEL 1                 && \
-  set_macro "$dst" PF_AWARE 0                 && \
+  set_macro "$dst" THRESH_PCT 25               && \
+  set_macro "$dst" USE_DUEL 1                  && \
+  set_macro "$dst" PF_AWARE 0                  && \
   set_macro "$dst" INST_QUOTA "$DYN_Q"        && \
   set_macro "$dst" INST_INSERT_RRPV "$DYN_I"  && \
   set_macro "$dst" WB_INSERT_RRPV "$DYN_W"    && \
